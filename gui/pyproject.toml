@@ -1,6 +1,6 @@
 [project]
 name = "die-apple-music"
-version = "1.1.0"
+version = "1.1.1"
 description = "死ねアップル: a native Windows app to download and play music from your own Apple Music account."
 requires-python = ">=3.10"
 # The app imports pywidevine (GPL-3.0-only), so the app as a whole is GPL-3.0.

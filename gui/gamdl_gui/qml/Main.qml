@@ -23,11 +23,17 @@ ApplicationWindow {
                                      albums: "Albums", songs: "Songs", organize: "Organize Files", database: "Media Database",
                                      sync: "Sync Playlists", settings: "Settings" })
 
+    MediaDevices { id: mediaDevices }
     MediaPlayer {
         id: mp
         // Perceptual volume: the slider position maps to loudness, not amplitude.
         // With system volume, the app plays at full level and Windows sets loudness.
-        audioOutput: AudioOutput { volume: Store.sysVolume ? 1.0 : Math.pow(Store.prefs.volume, 2) }
+        audioOutput: AudioOutput {
+            volume: Store.sysVolume ? 1.0 : Math.pow(Store.prefs.volume, 2)
+            // Follow Windows' default output live (headphones plugged in, Bluetooth
+            // connecting), instead of sticking to the device that was default at launch.
+            device: mediaDevices.defaultAudioOutput
+        }
         onMediaStatusChanged: if (mediaStatus === MediaPlayer.EndOfMedia) Store.next(true)
         onErrorOccurred: (error, errorString) => {
             Store.loading = false

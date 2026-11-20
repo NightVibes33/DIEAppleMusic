@@ -526,14 +526,23 @@ QtObject {
         playIndex = Math.max(0, Math.min(start || 0, entries.length - 1))
         loadCurrent()
     }
+    // Skipping quickly through songs only switches once the skipping stops.
+    // Opening a new audio stream for every press can wedge Bluetooth audio
+    // (AirPods): the song "plays" but nothing is heard until they reconnect.
+    property Timer _switchTimer: Timer { interval: 250; onTriggered: Store._startLoad() }
     function loadCurrent() {
         var e = playQueue[playIndex]
         if (!e) return
         current = e; loading = true
+        if (player && player.playbackState === 1) player.pause()   // keep the stream open
+        _switchTimer.restart()
+    }
+    function _startLoad() {
+        var e = playQueue[playIndex]
+        if (!e) return
         loadLyrics(e)
         rememberQueue()
         var token = ++_loadToken
-        if (player) player.stop()
         var done = function (r) {
             if (token !== _loadToken) return
             loading = false
