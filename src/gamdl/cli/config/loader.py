@@ -1,0 +1,435 @@
+"""Validated YAML configuration and native Click default maps."""
+
+from __future__ import annotations
+
+import shutil
+import tempfile
+from dataclasses import asdict, replace
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from gamdl.download import PathFormatter, PlaylistTags, Tags
+from gamdl.media import (
+    CoverFormat,
+    LyricsFormat,
+    MusicVideoCodec,
+    SongCodec,
+    UploadedVideoQuality,
+)
+from gamdl.media.constants import ARTIST_AUTO_SELECT_NAMES, LIBRARY_AUTO_SELECT_NAMES
+from gamdl.media.cover import validate_cover_size
+
+from ..options import TAG_NAMES
+from .models import (
+    AppConfig,
+    AuthConfig,
+    DatabaseConfig,
+    DownloadConfig,
+    OutputConfig,
+    SearchConfig,
+    UiConfig,
+)
+
+
+class ConfigError(ValueError):
+    """Invalid YAML syntax, key, type, or value."""
+
+
+class _UniqueLoader(yaml.SafeLoader):
+    """Reject ambiguous repeated keys instead of silently discarding settings."""
+
+
+def _mapping(loader: _UniqueLoader, node: yaml.MappingNode) -> dict:
+    result: dict = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node)
+        if not isinstance(key, str):
+            raise ConfigError("All YAML setting names must be strings")
+        if key in result:
+            raise ConfigError(f"Duplicate YAML setting: {key}")
+        result[key] = loader.construct_object(value_node)
+    return result
+
+
+_UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _mapping)
+
+
+def _merge(defaults: dict[str, Any], values: dict[str, Any], prefix: str = "") -> None:
+    for key, value in values.items():
+        name = f"{prefix}.{key}" if prefix else key
+        if key not in defaults:
+            continue
+        if isinstance(defaults[key], dict):
+            if not isinstance(value, dict):
+                raise ConfigError(f"{name} must be a mapping")
+            _merge(defaults[key], value, name)
+        else:
+            defaults[key] = value
+
+
+def _validate(config: dict[str, Any]) -> AppConfig:
+    if type(config["config_version"]) is not int or config["config_version"] != 1:
+        raise ConfigError("config_version must be 1")
+    groups = {
+        "auth": AuthConfig,
+        "download": DownloadConfig,
+        "output": OutputConfig,
+        "database": DatabaseConfig,
+        "ui": UiConfig,
+        "search": SearchConfig,
+    }
+    for section, cls in groups.items():
+        defaults = asdict(cls())
+        for key, value in config[section].items():
+            hint = defaults[key]
+            path = f"{section}.{key}"
+            if hint is None:
+                if value is not None and (
+                    not isinstance(value, str) or not value.strip()
+                ):
+                    raise ConfigError(f"{path} must be a string or null")
+            elif isinstance(hint, bool):
+                if type(value) is not bool:
+                    raise ConfigError(f"{path} must be a boolean")
+            elif section == "output" and key in {
+                "embedded_cover_size",
+                "file_cover_size",
+            }:
+                try:
+                    validate_cover_size(value, name=path)
+                except ValueError as exc:
+                    raise ConfigError(str(exc)) from exc
+            elif isinstance(hint, int):
+                if type(value) is not int or value < 1:
+                    raise ConfigError(f"{path} must be a positive integer")
+            elif isinstance(hint, list):
+                if (
+                    not isinstance(value, list)
+                    or (
+                        not value
+                        and path
+                        not in {
+                            "download.artist_auto_select",
+                            "download.library_auto_select",
+                            "output.exclude_tags",
+                        }
+                    )
+                    or any(
+                        not isinstance(item, str) or not item.strip() for item in value
+                    )
+                ):
+                    raise ConfigError(
+                        f"{path} must be a list of strings"
+                        if path
+                        in {
+                            "download.artist_auto_select",
+                            "download.library_auto_select",
+                            "output.exclude_tags",
+                        }
+                        else f"{path} must be a nonempty list of strings"
+                    )
+            elif not isinstance(value, str) or not value.strip():
+                raise ConfigError(f"{path} must be a nonempty string")
+
+    auth = AuthConfig(**config["auth"])
+    download = DownloadConfig(**config["download"])
+    output = OutputConfig(**config["output"])
+    database = DatabaseConfig(**config["database"])
+    ui = UiConfig(**config["ui"])
+    search = SearchConfig(**config["search"])
+    if search.api not in {"apple-music", "itunes"}:
+        raise ConfigError("search.api must be apple-music or itunes")
+    if auth.mode not in {None, "cookies", "wrapper", "media-user-token"}:
+        raise ConfigError(
+            "auth.mode must be null, cookies, wrapper or media-user-token"
+        )
+    if auth.drm_backend not in {"widevine", "playready"}:
+        raise ConfigError("auth.drm_backend must be widevine or playready")
+    # The CLI can ask for a missing PlayReady .prd interactively. In CI, the
+    # same missing path is reported without attempting to read from stdin.
+    if auth.storefront is not None and (
+        len(auth.storefront) != 2
+        or not auth.storefront.isascii()
+        or not auth.storefront.isalpha()
+    ):
+        raise ConfigError("auth.storefront must be a two-letter country code")
+    if output.cover_format not in {item.value for item in CoverFormat}:
+        raise ConfigError("output.cover_format must be jpg or png")
+    for name in ("lyrics_file_format", "embedded_lyrics_format"):
+        if getattr(output, name) not in {item.value for item in LyricsFormat}:
+            raise ConfigError(
+                f"output.{name} must be one of "
+                + ", ".join(item.value for item in LyricsFormat)
+            )
+    if output.music_video_container not in {"m4v", "mp4"}:
+        raise ConfigError("output.music_video_container must be m4v or mp4")
+    for name, values, allowed in (
+        ("artist_auto_select", download.artist_auto_select, ARTIST_AUTO_SELECT_NAMES),
+        (
+            "library_auto_select",
+            download.library_auto_select,
+            LIBRARY_AUTO_SELECT_NAMES,
+        ),
+    ):
+        if any(value not in allowed and value != "all" for value in values):
+            raise ConfigError(f"Invalid download.{name}")
+        if len(values) != len(set(values)):
+            raise ConfigError(f"download.{name} must not contain duplicates")
+    if any(name not in TAG_NAMES for name in output.exclude_tags):
+        raise ConfigError("Invalid output.exclude_tags")
+    if len(output.exclude_tags) != len(set(output.exclude_tags)):
+        raise ConfigError("output.exclude_tags must not contain duplicates")
+    if download.song_codec is not None and download.song_codec not in {
+        c.value for c in SongCodec
+    }:
+        raise ConfigError("Invalid download.song_codec")
+    if any(c not in {t.value for t in SongCodec} for c in download.song_codec_priority):
+        raise ConfigError("Invalid download.song_codec_priority")
+    if download.music_video_codec is not None and download.music_video_codec not in {
+        c.value for c in MusicVideoCodec
+    }:
+        raise ConfigError("Invalid download.music_video_codec")
+    if any(
+        c not in {t.value for t in MusicVideoCodec}
+        for c in download.music_video_codec_priority
+    ):
+        raise ConfigError("Invalid download.music_video_codec_priority")
+    if (
+        download.uploaded_video_quality is not None
+        and download.uploaded_video_quality
+        not in {c.value for c in UploadedVideoQuality}
+    ):
+        raise ConfigError("Invalid download.uploaded_video_quality")
+    if output.truncate is not None and (
+        type(output.truncate) is not int or output.truncate < 1
+    ):
+        raise ConfigError("output.truncate must be a positive integer or null")
+    formatter = PathFormatter(
+        album_folder_template=output.album_folder_template,
+        compilation_folder_template=output.compilation_folder_template,
+        no_album_folder_template=output.no_album_folder_template,
+        playlist_folder_template=output.playlist_folder_template,
+        single_disc_file_template=output.single_disc_file_template,
+        multi_disc_file_template=output.multi_disc_file_template,
+        no_album_file_template=output.no_album_file_template,
+        playlist_file_template=output.playlist_file_template,
+        truncate=output.truncate,
+    )
+    song_tags = Tags(
+        title="Example",
+        artist="Artist",
+        album_artist="Artist",
+        album="Album",
+        track_number=1,
+    )
+    try:
+        for tags in (
+            song_tags,
+            replace(song_tags, compilation=True),
+            replace(song_tags, disc_total=2, disc_number=1),
+            replace(song_tags, album=None),
+        ):
+            formatter.get_media_path(None, tags, extension=".m4a")
+        formatter.get_playlist_path(
+            PlaylistTags(title="List", artist="Curator", playlist_id="id", track=1)
+        )
+    except ValueError as exc:
+        raise ConfigError(f"Invalid output template: {exc}") from exc
+    return AppConfig(
+        auth=auth,
+        download=download,
+        output=output,
+        database=database,
+        ui=ui,
+        search=search,
+    )
+
+
+def _normalize(values: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+    """Drop unknown keys and populate missing keys without changing known values."""
+    result = {}
+    for key, default in defaults.items():
+        value = values.get(key, default)
+        if isinstance(default, dict) and isinstance(value, dict):
+            value = _normalize(value, default)
+        result[key] = value
+    return result
+
+
+def _migrate_legacy_concurrency(values: dict[str, Any]) -> dict[str, Any]:
+    """Preserve the old download.concurrency setting during normalization."""
+    old = values.get("download")
+    if not isinstance(old, dict) or "concurrency" not in old:
+        return values
+    updated = values.copy()
+    section = old.copy()
+    if "segment_concurrency" not in section:
+        section["segment_concurrency"] = section["concurrency"]
+    del section["concurrency"]
+    updated["download"] = section
+    return updated
+
+
+def _persist(path: Path, normalized: dict[str, Any]) -> None:
+    """Back up the original and atomically write a validated normalized config."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    backup = path.with_name(path.name + ".bak")
+    if path.exists() and not backup.exists():
+        shutil.copy2(path, backup)
+    if backup.exists():
+        backup.chmod(0o600)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        import os
+
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            yaml.safe_dump(normalized, stream, sort_keys=False, allow_unicode=True)
+        os.replace(name, path)
+        path.chmod(0o600)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def save_auth_configuration(
+    path: Path,
+    *,
+    mode: str,
+    cookies_path: str,
+    wrapper_url: str,
+    media_user_token: str | None,
+) -> None:
+    """Persist a validated authentication choice without disturbing other settings."""
+    if path.exists():
+        try:
+            loaded = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueLoader)
+        except (OSError, UnicodeError, yaml.YAMLError) as exc:
+            raise ConfigError(
+                "Cannot read configuration for authentication setup"
+            ) from exc
+        if loaded is None:
+            loaded = {}
+        if not isinstance(loaded, dict):
+            raise ConfigError("YAML config must be a mapping")
+    else:
+        loaded = asdict(AppConfig())
+    loaded = _migrate_legacy_concurrency(loaded)
+    auth = loaded.setdefault("auth", {})
+    auth.update(
+        mode=mode,
+        cookies_path=cookies_path,
+        wrapper_url=wrapper_url,
+        media_user_token=media_user_token,
+    )
+    defaults = asdict(AppConfig())
+    _merge(defaults, loaded)
+    _validate(defaults)
+    try:
+        _persist(path, _normalize(loaded, asdict(AppConfig())))
+    except OSError as exc:
+        raise ConfigError("Unable to save authentication configuration") from exc
+
+
+def save_output_directory(path: Path, directory: str) -> None:
+    """Persist a confirmed music library path without changing other settings."""
+    updated = asdict(load_config(path))
+    updated["output"]["directory"] = directory
+    _validate(updated)
+    try:
+        _persist(path, updated)
+    except OSError as exc:
+        raise ConfigError("Unable to save output directory configuration") from exc
+
+
+def load_config(path: Path | None) -> AppConfig:
+    """Load, validate and persist normalized YAML when the schema changes."""
+    defaults = asdict(AppConfig())
+    if path is None or not path.exists():
+        return _validate(defaults)
+    try:
+        loaded = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueLoader)
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise ConfigError(f"Cannot read config: {exc}") from exc
+    if loaded is None:
+        loaded = {}
+    if not isinstance(loaded, dict):
+        raise ConfigError("YAML config must be a mapping")
+    original = loaded
+    loaded = _migrate_legacy_concurrency(loaded)
+    schema = asdict(AppConfig())
+    normalized = _normalize(loaded, schema)
+    _merge(defaults, loaded)
+    result = _validate(defaults)
+    if normalized != original:
+        try:
+            _persist(path, normalized)
+        except OSError as exc:
+            raise ConfigError(f"Cannot update config: {exc}") from exc
+    return result
+
+
+def click_default_map(config: AppConfig) -> dict[str, Any]:
+    """Translate grouped settings to native Click rip option names."""
+    a, d, o, b, ui = (
+        config.auth,
+        config.download,
+        config.output,
+        config.database,
+        config.ui,
+    )
+    return {
+        "auth_mode": a.mode,
+        "cookies_path": a.cookies_path,
+        "wrapper_url": a.wrapper_url,
+        "media_user_token": a.media_user_token,
+        "wrapper_decrypt_host": a.wrapper_decrypt_host,
+        "wrapper_decrypt_port": a.wrapper_decrypt_port,
+        "storefront": a.storefront,
+        "language": a.language,
+        "drm_backend": a.drm_backend,
+        "device_path": a.device_path,
+        "output_dir": o.directory,
+        "temp_path": o.temp_path,
+        "music_video_container": o.music_video_container,
+        "overwrite": d.overwrite,
+        "use_album_date": d.use_album_date,
+        "segment_concurrency": d.segment_concurrency,
+        "concurrent_downloads": d.concurrent_downloads,
+        "song_codec": d.song_codec,
+        "song_codec_priority": tuple(d.song_codec_priority),
+        "music_video_codec": d.music_video_codec,
+        "music_video_codec_priority": tuple(d.music_video_codec_priority),
+        "max_height": d.max_height,
+        "uploaded_video_quality": d.uploaded_video_quality,
+        "save_cover": o.save_cover,
+        "no_tag": o.no_tag,
+        "exclude_tags": tuple(o.exclude_tags),
+        "cover_format": o.cover_format,
+        "embedded_cover_size": o.embedded_cover_size,
+        "file_cover_size": o.file_cover_size,
+        "no_lyrics_file": o.no_lyrics_file,
+        "lyrics_file_format": o.lyrics_file_format,
+        "embedded_lyrics_format": o.embedded_lyrics_format,
+        "date_tag_template": o.date_tag_template,
+        "save_playlist": o.save_playlist,
+        "fail_fast": d.fail_fast,
+        "artist_auto_select": tuple(d.artist_auto_select),
+        "library_auto_select": tuple(d.library_auto_select),
+        "album_folder_template": o.album_folder_template,
+        "compilation_folder_template": o.compilation_folder_template,
+        "no_album_folder_template": o.no_album_folder_template,
+        "playlist_folder_template": o.playlist_folder_template,
+        "single_disc_file_template": o.single_disc_file_template,
+        "multi_disc_file_template": o.multi_disc_file_template,
+        "no_album_file_template": o.no_album_file_template,
+        "playlist_file_template": o.playlist_file_template,
+        "truncate": o.truncate,
+        "database": not b.disabled,
+        "database_path": b.path,
+        "save_metadata": b.save_metadata,
+        "no_progress": ui.no_progress,
+        "max_visible_tracks": ui.max_visible_tracks,
+        "no_tracebacks": ui.no_tracebacks,
+        "search_api": config.search.api,
+    }

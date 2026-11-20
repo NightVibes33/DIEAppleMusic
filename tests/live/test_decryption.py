@@ -1,0 +1,413 @@
+"""Opt-in live decryption smoke tests; downloads real media and requests licenses.
+
+Run explicitly:
+    GAMDL_RUN_LIVE_DECRYPT=1 uv run python -m unittest tests.live.test_decryption -v
+
+To additionally remux each decrypted rendition and compare encoded packets:
+    GAMDL_RUN_LIVE_DECRYPT=1 GAMDL_CHECK_REMUX=1 uv run python -m unittest tests.live.test_decryption -v
+
+The wrapper tests skip when no authenticated local wrapper is available.
+Media is written only to temporary files; neither content keys nor signed
+CDN URLs are printed or retained. Tests may require an Apple Music subscription.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+
+from gamdl.drm import ContentKey, Drm, DrmLicenseError
+from gamdl.media import (
+    HlsType,
+    Song,
+    SongCodec,
+    SongStreamResolver,
+    StreamOrigin,
+)
+from gamdl.stream import Streamer
+from gamdl.muxer import Muxer
+from tests.live_auth import LiveSettings, open_live_session
+from tests.live.song_fixture import (
+    ENHANCED_CODECS,
+    ENHANCED_WIDEVINE_CODECS,
+    SONG_ID,
+    STANDARD_CODECS,
+    WEB_CODECS,
+)
+
+
+@unittest.skipUnless(
+    os.environ.get("GAMDL_RUN_LIVE_DECRYPT") == "1",
+    "Opt-in only: set GAMDL_RUN_LIVE_DECRYPT=1 to download and decrypt live media",
+)
+@unittest.skipUnless(
+    shutil.which("ffmpeg"), "Requires FFmpeg for decoded audio validation"
+)
+class StreamDecryptionLiveTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.context = open_live_session(LiveSettings.from_env(), interval=0.75)
+        self.session = await self.context.__aenter__()
+        self.addAsyncCleanup(self.context.__aexit__, None, None, None)
+        self.song = Song.from_id(SONG_ID, api=self.session.api)
+        self.drm = Drm.from_widevine(self.session.api)
+        self.directory = TemporaryDirectory(prefix="gamdl-decryption-test-")
+        self.addCleanup(self.directory.cleanup)
+
+    async def asset(self, origin: StreamOrigin, codec: SongCodec = SongCodec.AAC):
+        sources = await SongStreamResolver(self.song).get_hls_streams(origin=origin)
+        self.assertTrue(sources, "No HLS renditions for requested source")
+        candidates = [track for track in sources if track.codec == codec]
+        self.assertTrue(
+            candidates,
+            f"{codec.value} is missing from the live {origin.value} fixture",
+        )
+        return max(candidates, key=lambda track: track.bitrate or 0)
+
+    async def download_and_check(
+        self, source, *, key=None, wrapper=False, auto=False, expected_method=None
+    ):
+        if wrapper and self.session.wrapper is None:
+            self.skipTest("No authenticated wrapper instance available")
+        # Stable per-rendition test output name, useful for later muxer tests.
+        name = (
+            self.id().rsplit(".", 1)[-1]
+            + f"-{source.origin.value}-{source.codec.value}"
+            + ("-auto" if auto else "-wrapper" if wrapper else "-key")
+            + ".m4a"
+        )
+        path = Path(self.directory.name) / name
+        async with Streamer(
+            source,
+            wrapper_api=self.session.wrapper if wrapper or auto else None,
+            decryption_key=key,
+            drm=self.drm if auto else None,
+        ) as stream:
+            if expected_method is not None:
+                self.assertEqual(stream.decryption_method, expected_method)
+            await stream.save(path)
+            progress = stream.progress
+            self.assertEqual(progress.completed_parts, progress.total_parts)
+            self.assertGreater(progress.emitted_bytes, 4096)
+            self.assertEqual(progress.emitted_bytes, path.stat().st_size)
+
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-hide_banner",
+                "-v",
+                "error",
+                "-xerror",
+                "-i",
+                str(path),
+                "-map",
+                "0:a:0",
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"FFmpeg could not decode {source.codec.value} from {source.origin.value}: "
+            + result.stderr[:320],
+        )
+        # The current output is still a fragmented MP4. Validate the actual
+        # decoded track type now; the same check can be reused after muxing.
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=codec_name,channels",
+                "-of",
+                "json",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(probe.returncode, 0, probe.stderr[:320])
+        streams = json.loads(probe.stdout).get("streams", [])
+        self.assertEqual(len(streams), 1, "Expected exactly one audio stream")
+        expected_codec = {
+            SongCodec.ALAC_LOSSLESS: "alac",
+            SongCodec.ALAC_HIRES: "alac",
+            SongCodec.ATMOS: "eac3",
+        }.get(source.codec, "aac")
+        self.assertEqual(
+            streams[0].get("codec_name"),
+            expected_codec,
+            f"Incorrect output codec for {source.codec.value}",
+        )
+        self.assertGreater(streams[0].get("channels", 0), 0)
+        if os.environ.get("GAMDL_CHECK_REMUX") == "1":
+            flat = path.with_name(path.stem + "-flat.m4a")
+            flat.write_bytes(Muxer().remux(path.read_bytes()))
+
+            def encoded_packets(file):
+                result = subprocess.run(
+                    [
+                        "ffprobe",
+                        "-v",
+                        "error",
+                        "-select_streams",
+                        "a:0",
+                        "-show_packets",
+                        "-show_data_hash",
+                        "md5",
+                        "-show_entries",
+                        "packet=size,data_hash",
+                        "-of",
+                        "csv=p=0",
+                        str(file),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                    check=True,
+                )
+                return [tuple(row.split(",")[:2]) for row in result.stdout.splitlines()]
+
+            self.assertEqual(encoded_packets(path), encoded_packets(flat))
+            flat_probe = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a:0",
+                    "-show_entries",
+                    "stream=codec_name",
+                    "-of",
+                    "default=nw=1:nk=1",
+                    str(flat),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+            )
+            self.assertEqual(flat_probe.stdout.strip(), expected_codec)
+            flat_decoded = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-nostdin",
+                    "-hide_banner",
+                    "-v",
+                    "error",
+                    "-xerror",
+                    "-i",
+                    str(flat),
+                    "-map",
+                    "0:a:0",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(flat_decoded.returncode, 0, flat_decoded.stderr[:350])
+        if shutil.which("mediainfo"):
+            info = subprocess.run(
+                ["mediainfo", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(info.returncode, 0)
+            conformance = [
+                line.strip()
+                for line in info.stdout.splitlines()
+                if "CMAF does not permit" in line or "channelConfigurationIndex" in line
+            ]
+            if conformance:
+                print(
+                    "MediaInfo codec/CMAF conformance notice "
+                    f"for {source.codec.value} ({source.origin.value}): "
+                    + "; ".join(conformance)[:350]
+                )
+        return path
+
+    async def license_key(self, source) -> ContentKey:
+        key = await self.drm.get_keys(
+            media_id=self.song.id,
+            drm_info=await source.get_drm_info(),
+            is_library=self.song.is_library,
+        )
+        self.assertIsInstance(key, ContentKey)
+        return key
+
+    async def test_decrypt_web_aac_content_key(self):
+        source = await self.song.get_stream(codec=SongCodec.AAC_WEB)
+        self.assertEqual(source.origin, StreamOrigin.WEBPLAYBACK)
+        await self.download_and_check(source, key=await self.license_key(source))
+
+    async def test_auto_widevine_web_aac(self):
+        source = await self.song.get_stream(codec=SongCodec.AAC_WEB)
+        await self.download_and_check(source, auto=True, expected_method="widevine")
+
+    async def test_auto_wrapper_enhanced_asset_alac(self):
+        if self.session.wrapper is None:
+            self.skipTest("Authenticated wrapper instance required")
+        source = await self.asset(StreamOrigin.ASSET_ENHANCED_HLS, SongCodec.ALAC_HIRES)
+        await self.download_and_check(source, auto=True, expected_method="wrapper")
+
+    async def test_web_all_other_codecs_with_content_key(self):
+        for codec in WEB_CODECS:
+            if codec == SongCodec.AAC_WEB:
+                continue  # Covered by the dedicated web AAC regression.
+            with self.subTest(codec=codec.value):
+                source = await self.song.get_stream(codec=codec)
+                self.assertEqual(source.codec, codec)
+                self.assertEqual(source.origin, StreamOrigin.WEBPLAYBACK)
+                await self.download_and_check(
+                    source, key=await self.license_key(source)
+                )
+
+    async def test_decrypt_enhanced_hls_content_key(self):
+        source = await self.asset(StreamOrigin.ASSET_ENHANCED_HLS)
+        self.assertEqual(source.hls_type, HlsType.ENHANCED)
+        decrypted = await self.download_and_check(
+            source, key=await self.license_key(source)
+        )
+        # Compare MediaInfo against Apple's exact original encrypted bytes:
+        # an upstream CMAF/USAC warning must not be blamed on decryption.
+        raw = Path(self.directory.name) / "encrypted-original.m4a"
+        async with Streamer(source) as stream:
+            await stream.save(raw)
+        if shutil.which("mediainfo"):
+
+            def notices(path):
+                result = subprocess.run(
+                    ["mediainfo", str(path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=True,
+                )
+                return [
+                    line.strip()
+                    for line in result.stdout.splitlines()
+                    if "CMAF does not permit USAC" in line
+                ]
+
+            self.assertEqual(notices(raw), notices(decrypted))
+        # Decryption must not rewrite the codec's DecoderSpecificInfo.
+        init = await source.get_init_segment()
+        if init and b"esds" in init:
+            pos = init.index(b"esds")
+            size = int.from_bytes(init[pos - 4 : pos], "big")
+            self.assertGreater(size, 8)
+            self.assertEqual(
+                init[pos - 4 : pos - 4 + size],
+                decrypted.read_bytes()[pos - 4 : pos - 4 + size],
+            )
+
+    async def test_decrypt_standard_asset_hls_content_key(self):
+        source = await self.asset(StreamOrigin.ASSET_STANDARD_HLS)
+        self.assertEqual(source.hls_type, HlsType.STANDARD)
+        await self.download_and_check(source, key=await self.license_key(source))
+
+    async def test_all_other_enhanced_codecs_with_content_key(self):
+        for codec in ENHANCED_WIDEVINE_CODECS:
+            if codec in {SongCodec.AAC, SongCodec.AAC_HE}:
+                continue  # Dedicated AAC and HE-AAC/MediaInfo checks below.
+            with self.subTest(codec=codec.value):
+                source = await self.asset(StreamOrigin.ASSET_ENHANCED_HLS, codec=codec)
+                self.assertEqual(source.hls_type, HlsType.ENHANCED)
+                await self.download_and_check(
+                    source, key=await self.license_key(source)
+                )
+
+    async def test_all_other_standard_asset_codecs_with_content_key(self):
+        for codec in STANDARD_CODECS:
+            if codec == SongCodec.AAC:
+                continue  # Covered by the dedicated standard AAC regression.
+            with self.subTest(codec=codec.value):
+                source = await self.asset(StreamOrigin.ASSET_STANDARD_HLS, codec=codec)
+                self.assertEqual(source.hls_type, HlsType.STANDARD)
+                await self.download_and_check(
+                    source, key=await self.license_key(source)
+                )
+
+    async def test_alac_content_key_when_license_available(self):
+        source = await self.asset(
+            StreamOrigin.ASSET_ENHANCED_HLS, codec=SongCodec.ALAC_HIRES
+        )
+        try:
+            key = await self.license_key(source)
+        except DrmLicenseError:
+            self.skipTest(
+                "Apple currently rejects Widevine ALAC license requests; "
+                "ALAC is fully validated via wrapper FairPlay instead"
+            )
+        await self.download_and_check(source, key=key)
+
+    async def test_wrapper_enhanced_hls(self):
+        if self.session.wrapper is None:
+            self.skipTest("No authenticated wrapper instance available")
+        source = await self.song.get_stream(
+            codec=SongCodec.AAC,
+            wrapper_api=self.session.wrapper,
+        )
+        self.assertEqual(source.origin, StreamOrigin.WRAPPER_HLS)
+        self.assertEqual(source.hls_type, HlsType.ENHANCED)
+        await self.download_and_check(source, wrapper=True)
+
+    async def test_wrapper_all_other_enhanced_codecs(self):
+        if self.session.wrapper is None:
+            self.skipTest("No authenticated wrapper instance available")
+        resolver = SongStreamResolver(self.song, wrapper_api=self.session.wrapper)
+        sources = await resolver.get_hls_streams(origin=StreamOrigin.WRAPPER_HLS)
+        found = {source.codec for source in sources}
+        self.assertTrue(set(ENHANCED_CODECS) <= found)
+        for codec in ENHANCED_CODECS:
+            if codec == SongCodec.AAC:
+                continue  # Covered by the dedicated enhanced wrapper test.
+            with self.subTest(codec=codec.value):
+                source = max(
+                    (s for s in sources if s.codec == codec),
+                    key=lambda stream: stream.bitrate or 0,
+                )
+                self.assertEqual(source.hls_type, HlsType.ENHANCED)
+                await self.download_and_check(source, wrapper=True)
+
+    async def test_wrapper_standard_asset_hls(self):
+        if self.session.wrapper is None:
+            self.skipTest("No authenticated wrapper instance available")
+        source = await self.asset(StreamOrigin.ASSET_STANDARD_HLS)
+        await self.download_and_check(source, wrapper=True)
+
+    async def test_wrapper_all_other_standard_asset_codecs(self):
+        if self.session.wrapper is None:
+            self.skipTest("No authenticated wrapper instance available")
+        for codec in STANDARD_CODECS:
+            if codec == SongCodec.AAC:
+                continue  # Covered by dedicated wrapper/standard AAC test.
+            with self.subTest(codec=codec.value):
+                source = await self.asset(StreamOrigin.ASSET_STANDARD_HLS, codec=codec)
+                await self.download_and_check(source, wrapper=True)
+
+    async def test_aac_he_mediainfo_diagnostic(self):
+        # Extra smoke case to distinguish an HE-AAC codec/profile conformance
+        # warning from an actual CBCS audio-decoding error.
+        source = await self.asset(
+            StreamOrigin.ASSET_ENHANCED_HLS, codec=SongCodec.AAC_HE
+        )
+        await self.download_and_check(source, key=await self.license_key(source))

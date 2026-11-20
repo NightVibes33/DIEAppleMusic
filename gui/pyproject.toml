@@ -1,0 +1,28 @@
+[project]
+name = "die-apple-music"
+version = "1.1.0"
+description = "死ねアップル: a native Windows app to download and play music from your own Apple Music account."
+requires-python = ">=3.10"
+# The app imports pywidevine (GPL-3.0-only), so the app as a whole is GPL-3.0.
+license = "GPL-3.0-only"
+dependencies = [
+    "gamdl[widevine]>=4.0,<5",
+    "PySide6>=6.9",
+    "mutagen>=1.47",
+]
+
+[project.urls]
+Source = "https://github.com/NightVibes33/DIEAppleMusic"
+
+[project.gui-scripts]
+die-apple-music = "gamdl_gui.app:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["gamdl_gui"]
+
+[tool.setuptools.package-data]
+gamdl_gui = ["qml/*.qml", "qml/qmldir", "qml/icons/*.svg", "qml/icons/*.png"]

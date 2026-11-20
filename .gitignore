@@ -1,0 +1,33 @@
+# Virtual environments, build and Python caches
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+target/
+/native/target/
+*.so
+*.pyd
+*.dylib
+
+# Local configuration and private files
+.env
+.env.*
+!.env.example
+/.local/
+
+# Gamdl desktop app build output
+/dist/
+/build/
+build-log.txt
+/release/
+
+# Local scratch
+/work/
+*.bak

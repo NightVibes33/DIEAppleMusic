@@ -1,0 +1,81 @@
+[project]
+name = "gamdl"
+version = "4.0.1"
+description = "A command-line app for downloading Apple Music songs, albums, playlists, music videos, and uploaded videos."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Glomatico" },
+]
+dependencies = [
+    "async-lru>=2.0,<3",
+    "click>=8.3,<9",
+    "dataclass-click>=1.0.4,<2",
+    "httpx>=0.28.1,<1",
+    "httpx-retries>=0.6,<1",
+    "m3u8>=6,<7",
+    "platformdirs>=4,<6",
+    "prompt-toolkit>=3.0.43,<4",
+    "pyyaml>=6,<7",
+    "questionary>=2,<3",
+    "rich>=14,<16",
+    "structlog>=25.4,<27",
+]
+
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Utilities",
+]
+
+[project.scripts]
+gamdl = "gamdl.cli.main:main"
+
+[project.urls]
+Homepage = "https://github.com/glomatico/gamdl"
+Repository = "https://github.com/glomatico/gamdl"
+Issues = "https://github.com/glomatico/gamdl/issues"
+
+[project.optional-dependencies]
+widevine = [
+    "pywidevine>=1.9,<2",
+]
+playready = [
+    "pyplayready>=0.8.5,<1",
+]
+
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+manifest-path = "native/Cargo.toml"
+python-source = "src"
+module-name = "gamdl._native"
+bindings = "pyo3"
+include = ["LICENSE"]
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "native/Cargo.toml" },
+    { file = "native/Cargo.lock" },
+    { file = "native/src/**/*.rs" },
+    { file = "src/gamdl/**/*.py" },
+]
+
+[dependency-groups]
+dev = [
+    "python-dotenv>=1.1,<2",
+]

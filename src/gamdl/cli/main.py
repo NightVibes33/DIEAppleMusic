@@ -1,0 +1,80 @@
+"""Gamdl command group; YAML is loaded before subcommand option parsing."""
+
+from pathlib import Path
+from dataclasses import asdict
+
+import click
+import yaml
+
+from gamdl import __version__
+
+from .config.commands import config_group
+from .config.loader import ConfigError, click_default_map, load_config
+from .config.models import AppConfig, config_path as default_config_path
+from .errors import CliCommand
+
+
+@click.group(cls=CliCommand, context_settings={"auto_envvar_prefix": "GAMDL"})
+@click.version_option(__version__, "--version", "-v", prog_name="Gamdl")
+@click.option(
+    "--config",
+    "config_file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    envvar="GAMDL_CONFIG",
+    help="YAML configuration path",
+)
+@click.option("--no-config", is_flag=True, help="Ignore YAML configuration")
+@click.pass_context
+def main(ctx: click.Context, config_file: Path | None, no_config: bool) -> None:
+    """Gamdl 4.0 — download Apple Music with configurable codecs and progress."""
+    path = (config_file or default_config_path()).expanduser()
+    ctx.obj = {
+        "config_path": path,
+        "config_explicit": config_file is not None,
+        "no_config": no_config,
+    }
+    if (
+        not no_config
+        and not path.exists()
+        and ctx.invoked_subcommand not in {None, "config"}
+    ):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("x", encoding="utf-8") as stream:
+                stream.write(
+                    "# Gamdl 4.0 configuration; CLI flags override these values.\n\n"
+                    + yaml.safe_dump(
+                        asdict(AppConfig()), sort_keys=False, allow_unicode=True
+                    )
+                )
+            path.chmod(0o600)
+            click.echo(f"Created config at {path.absolute()}")
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise click.ClickException(f"Cannot create config: {error}") from None
+    try:
+        config = load_config(None if no_config else path)
+    except ConfigError as exc:
+        raise click.ClickException(str(exc)) from None
+    ctx.obj["settings"] = config
+    defaults = click_default_map(config)
+    ctx.default_map = {"rip": defaults, "library": defaults, "search": defaults}
+
+
+from .commands.auth import auth
+from .commands.database import database_group
+from .commands.library import library
+from .commands.organize import organize
+from .commands.rip import rip
+from .commands.search import search
+from .commands.sync import sync
+
+main.add_command(rip)
+main.add_command(auth)
+main.add_command(library)
+main.add_command(search)
+main.add_command(config_group)
+main.add_command(database_group)
+main.add_command(organize)
+main.add_command(sync)
