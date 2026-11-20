@@ -46,8 +46,8 @@ Get the latest release from the [Releases page](https://github.com/NightVibes33/
 
 | File | What it is |
 | --- | --- |
-| `死ねアップル-Setup.exe` | Installer. Installs for your user account without admin rights, adds Start menu and desktop shortcuts, and offers update, repair or uninstall when you run it again. |
-| `死ねアップル-Portable.zip` | Travel version. Unzip it anywhere, such as a USB stick, and run `死ねアップル.exe`. Settings, sign-in and caches stay in the `Data` folder beside it. |
+| `DIEAppleMusic-<version>-Setup.exe` | Installer. Installs for your user account without admin rights, adds Start menu and desktop shortcuts, and offers update, repair or uninstall when you run it again. |
+| `DIEAppleMusic-<version>-Portable.zip` | Travel version. Unzip it anywhere, such as a USB stick, and run `死ねアップル.exe`. Settings, sign-in and caches stay in the `Data` folder beside it. |
 
 Then open the app, click **Sign In**, sign in with your Apple ID and choose where to save your music.
 
