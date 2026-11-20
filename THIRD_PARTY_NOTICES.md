@@ -14,13 +14,13 @@ The files under `src/`, `native/`, `tests/` and `docs/gamdl-*` come from gamdl, 
 
 | Component | Version | License | Source |
 | --- | --- | --- | --- |
-| Python | 3.12 | PSF License 2.0 | https://www.python.org |
-| Qt 6 (including Qt Quick, Qt Multimedia and Qt WebEngine) | 6.12 | LGPL-3.0 | https://code.qt.io, https://download.qt.io/official_releases/qt/ |
+| Python | 3.12 | PSF License 2.0 ([`LICENSES/Python-PSF.txt`](LICENSES/Python-PSF.txt)) | https://www.python.org |
+| Qt 6 (including Qt Quick, Qt Multimedia and Qt WebEngine) | 6.12 | LGPL-3.0 ([`LICENSES/LGPL-3.0.txt`](LICENSES/LGPL-3.0.txt)) | https://code.qt.io, https://download.qt.io/official_releases/qt/ |
 | PySide6 / Shiboken6 (Qt for Python) | 6.12.0 | LGPL-3.0 | https://code.qt.io/cgit/pyside/pyside-setup.git |
 | Chromium (inside Qt WebEngine, used for the Apple sign-in panel) | — | BSD-3-Clause and others; see Qt WebEngine's licensing | https://doc.qt.io/qt-6/qtwebengine-licensing.html |
 | FFmpeg (inside Qt Multimedia) | 9.0 | LGPL-2.1-or-later | https://ffmpeg.org |
 
-**LGPL compliance.** Qt, PySide6 and FFmpeg are included unmodified, as separate dynamic libraries (`_internal\PySide6\*.dll`). You can replace them with your own builds of the same versions. Their complete source code is available from the links above, and the source code of this app is in this repository.
+**LGPL compliance.** The full text of the LGPL-3.0 is in [`LICENSES/LGPL-3.0.txt`](LICENSES/LGPL-3.0.txt); it builds on the GPL-3.0 in [`LICENSE`](LICENSE). Both ship inside the app. Qt, PySide6 and FFmpeg are included unmodified, as separate dynamic libraries (`_internal\PySide6\*.dll`). You can replace them with your own builds of the same versions. Their complete source code is available from the links above, and the source code of this app is in this repository.
 
 ## Python libraries
 
